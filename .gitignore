@@ -1,0 +1,11 @@
+.venv/
+.venv-kraken/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+output/
+.idea/
+.vscode/
+web/node_modules/
+web/.next/
