@@ -1,0 +1,16 @@
+.git
+.venv
+.venv-kraken
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+output
+.env
+.env.*
+web/node_modules
+web/.next
+tests
+docs
+.idea
+.vscode
+agent-transcripts

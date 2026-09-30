@@ -17,6 +17,7 @@ function apiOrigin() {
 const api = apiOrigin();
 
 const nextConfig: NextConfig = {
+  output: "standalone",
   allowedDevOrigins: ["127.0.0.1", "localhost"],
   experimental: {
     // A detecção de linhas pode levar minutos; o proxy do Next corta em 30s.
