@@ -13,7 +13,7 @@ O **PaleonIA** recebe imagens de documentos manuscritos, prepara a página para 
 
 ## Tela do sistema
 
-![Mesa do PaleonIA com documento carregado e linhas detectadas](docs/images/mesa-transcricao.jpg)
+![Mesa do PaleonIA com documento carregado e linhas detectadas](docs/images/mesa-transcricao.png)
 
 *Captura da aplicação local com um documento histórico. As faixas sobre a página correspondem às linhas editáveis da transcrição.*
 
