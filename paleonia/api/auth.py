@@ -50,10 +50,8 @@ def read_username(token: str, settings: Settings, now: float | None = None) -> s
         return None
     expires = payload.get("exp")
     username = payload.get("u")
-    if not isinstance(expires, int) or not isinstance(username, str):
+    if not isinstance(expires, int) or not isinstance(username, str) or not username:
         return None
     if expires < int(now if now is not None else time.time()):
-        return None
-    if not hmac.compare_digest(username, settings.auth_username):
         return None
     return username

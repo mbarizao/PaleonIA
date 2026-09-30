@@ -15,7 +15,12 @@ export function stripLine(line: Line) {
     id: line.id,
     box: line.box.slice(0, 4).map((value) => Math.round(Number(value))),
     include: line.include !== false,
-    parts: (line.parts || []).map((part) => ({ id: part.id, text: part.text || "" })),
+    parts: (line.parts || []).map((part) => ({
+      id: part.id,
+      text: part.text || "",
+      confirmed: Boolean(part.confirmed) && Boolean((part.text || "").trim()),
+      skipped: Boolean(part.skipped) && Boolean((part.text || "").trim()) && !part.confirmed,
+    })),
   };
 }
 
@@ -70,6 +75,11 @@ export function viewMetrics(page: Page, showOriginal: boolean) {
   return { width: page.width, height: page.height };
 }
 
+export function viewScale(page: Page) {
+  const scale = Number(page.view_scale || 1);
+  return scale > 0 ? scale : 1;
+}
+
 export function viewOffset(page: Page, showOriginal: boolean) {
   if (!showOriginal) return [0, 0];
   const origin = page.crop_origin || [0, 0];
@@ -78,7 +88,9 @@ export function viewOffset(page: Page, showOriginal: boolean) {
 
 export function toViewBox(page: Page, showOriginal: boolean, box: number[]) {
   const [ox, oy] = viewOffset(page, showOriginal);
-  return [box[0] + ox, box[1] + oy, box[2] + ox, box[3] + oy];
+  if (!showOriginal) return [box[0] + ox, box[1] + oy, box[2] + ox, box[3] + oy];
+  const scale = viewScale(page);
+  return [box[0] / scale + ox, box[1] / scale + oy, box[2] / scale + ox, box[3] / scale + oy];
 }
 
 export function clampBox(box: number[], width: number, height: number, minSize = 2) {
@@ -88,6 +100,19 @@ export function clampBox(box: number[], width: number, height: number, minSize =
   x1 = Math.max(x0 + minSize, Math.min(width, x1));
   y1 = Math.max(y0 + minSize, Math.min(height, y1));
   return [x0, y0, x1, y1];
+}
+
+export function draftParts(pages: Page[]) {
+  const found: { page: Page; line: Line; part: Part }[] = [];
+  for (const page of pages) {
+    for (const line of annotate(page.lines)) {
+      if (!line.include) continue;
+      for (const part of line.parts) {
+        if ((part.text || "").trim() && !part.confirmed && !part.skipped) found.push({ page, line, part });
+      }
+    }
+  }
+  return found;
 }
 
 export function labelFor(line: Line) {

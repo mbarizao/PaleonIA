@@ -10,9 +10,10 @@ import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from paleonia.config import IMAGE_MAX_PIXELS, get_settings, limit_text
-from paleonia.enhance import compose_reading_view
-from paleonia.preprocess import encode_jpeg, load_image
-from paleonia.segment import segment_line_boxes
+from paleonia.image_enhance.enhance import compose_reading_view
+from paleonia.image_enhance.preprocess import encode_jpeg, load_image
+from paleonia.segment.fragments import keep_line_boxes
+from paleonia.segment.kraken import segment_line_boxes
 
 PAGE_ID_RE = re.compile(r"^p\d{3,6}$")
 ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,48}$")
@@ -63,6 +64,8 @@ def annotate_lines(lines: list[dict]) -> list[dict]:
             record = {
                 "id": part["id"],
                 "text": part.get("text") or "",
+                "confirmed": bool(part.get("confirmed")),
+                "skipped": bool(part.get("skipped")) and not bool(part.get("confirmed")),
                 "parte": part_index,
                 "linha_transcrita": None,
             }
@@ -102,7 +105,15 @@ def _copy_line(line: dict) -> dict:
         "id": line["id"],
         "box": [int(value) for value in line["box"][:4]],
         "include": bool(line.get("include", True)),
-        "parts": [{"id": part["id"], "text": part.get("text") or ""} for part in line.get("parts") or []],
+        "parts": [
+            {
+                "id": part["id"],
+                "text": part.get("text") or "",
+                "confirmed": bool(part.get("confirmed")),
+                "skipped": bool(part.get("skipped")) and not bool(part.get("confirmed")),
+            }
+            for part in line.get("parts") or []
+        ],
     }
 
 
@@ -137,14 +148,38 @@ def _apply_boxes(old_lines: list[dict], boxes: list[list[int]]) -> list[dict]:
     for old in unused:
         if any((part.get("text") or "").strip() for part in old["parts"]):
             result.append(old)
-    return result
+    return _without_fragments(result)
 
 
-def _shift_box(box: list[int], dx: int, dy: int, width: int, height: int) -> list[int]:
-    x0 = int(np.clip(int(box[0]) - dx, 0, max(0, width - 1)))
-    y0 = int(np.clip(int(box[1]) - dy, 0, max(0, height - 1)))
-    x1 = int(np.clip(int(box[2]) - dx, x0 + 1, width))
-    y1 = int(np.clip(int(box[3]) - dy, y0 + 1, height))
+PREP_VERSION = 3
+
+
+def _to_original_box(box, origin, scale) -> list[float]:
+    """Desfaz corte e escala para voltar à coordenada da imagem original."""
+    ox = float(origin[0]) if origin else 0.0
+    oy = float(origin[1]) if origin and len(origin) > 1 else 0.0
+    factor = float(scale) if scale else 1.0
+    if factor <= 0:
+        factor = 1.0
+    return [
+        ox + float(box[0]) / factor,
+        oy + float(box[1]) / factor,
+        ox + float(box[2]) / factor,
+        oy + float(box[3]) / factor,
+    ]
+
+
+def _to_view_box(box, origin_x: int, origin_y: int, scale: float, width: int, height: int) -> list[int]:
+    """Leva uma caixa do original para a imagem tratada (cortada e ampliada)."""
+    factor = float(scale) if scale else 1.0
+    x0 = int(round((float(box[0]) - origin_x) * factor))
+    y0 = int(round((float(box[1]) - origin_y) * factor))
+    x1 = int(round((float(box[2]) - origin_x) * factor))
+    y1 = int(round((float(box[3]) - origin_y) * factor))
+    x0 = int(np.clip(x0, 0, max(0, width - 1)))
+    y0 = int(np.clip(y0, 0, max(0, height - 1)))
+    x1 = int(np.clip(x1, x0 + 1, width))
+    y1 = int(np.clip(y1, y0 + 1, height))
     return [x0, y0, x1, y1]
 
 
@@ -197,11 +232,50 @@ def _clean_lines(raw: list[dict], width: int, height: int) -> list[dict]:
             if not ITEM_ID_RE.fullmatch(part_id) or part_id in seen_parts:
                 raise ValueError(f"Identificador de transcrição inválido: {part_id}")
             seen_parts.add(part_id)
-            parts.append({"id": part_id, "text": limit_text(str(part.get("text") or ""))})
+            parts.append(
+                {
+                    "id": part_id,
+                    "text": limit_text(str(part.get("text") or "")),
+                    "confirmed": bool(part.get("confirmed")),
+                    "skipped": bool(part.get("skipped")),
+                }
+            )
         if include and not parts:
             parts.append({"id": _new_id("pt"), "text": ""})
         cleaned.append({"id": line_id, "box": box, "include": include, "parts": parts})
     return cleaned
+
+
+def _apply_confirmation(old_lines: list[dict], cleaned: list[dict]) -> None:
+    """Conferido e ilegível só mudam quando a correção pede. Arrastar a faixa conserva a marca."""
+    previous = {part["id"]: part for line in old_lines for part in line.get("parts") or []}
+    for line in cleaned:
+        for part in line["parts"]:
+            text = part.get("text") or ""
+            if not text.strip():
+                part["confirmed"] = False
+                part["skipped"] = False
+                continue
+            old = previous.get(part["id"])
+            changed = old is not None and (old.get("text") or "") != text
+            if part.get("confirmed"):
+                part["confirmed"] = True
+                part["skipped"] = False
+                continue
+            if part.get("skipped") and not changed:
+                part["confirmed"] = False
+                part["skipped"] = True
+                continue
+            if old is None:
+                part["confirmed"] = True
+                part["skipped"] = False
+                continue
+            if changed:
+                part["confirmed"] = False
+                part["skipped"] = False
+                continue
+            part["confirmed"] = bool(old.get("confirmed"))
+            part["skipped"] = bool(old.get("skipped")) and not part["confirmed"]
 
 
 def _clamp_box(box, width: int, height: int) -> list[int]:
@@ -227,14 +301,16 @@ class DeskStore:
             self.session = {"pages": []}
         self.session.setdefault("pages", [])
         self._lock = threading.Lock()
+        if self._strip_fragments():
+            self._save()
 
-    def add_page(self, filename: str, data: bytes, sensitivity: float | None = None) -> dict:
+    def add_page(self, filename: str, data: bytes, sensitivity: float | None = None, *, progress=None) -> dict:
         jpeg, _width, _height = normalize_image(data)
         page_id = self._next_page_id()
         image_path = self.images / f"{page_id}.jpg"
         original_path = self.images / f"{page_id}.original.jpg"
         decoded = load_image(jpeg, invalid="Não foi possível ler a imagem. Use JPG ou PNG.")
-        view, origin_x, origin_y = compose_reading_view(decoded)
+        view, origin_x, origin_y, scale = compose_reading_view(decoded, progress=progress)
         height, width = view.shape[:2]
         image_path.write_bytes(encode_jpeg(view))
         original_path.write_bytes(jpeg)
@@ -253,6 +329,8 @@ class DeskStore:
             "original_width": int(decoded.shape[1]),
             "original_height": int(decoded.shape[0]),
             "crop_origin": [int(origin_x), int(origin_y)],
+            "view_scale": int(scale),
+            "prep_version": PREP_VERSION,
             "prepared": True,
             "sensitivity": level,
             "lines": [_line_from_box(box) for box in boxes],
@@ -263,7 +341,9 @@ class DeskStore:
 
     def replace_lines(self, page_id: str, lines: list[dict], sensitivity: float | None = None) -> dict:
         page = self._require(page_id)
-        page["lines"] = _clean_lines(lines, int(page["width"]), int(page["height"]))
+        cleaned = _clean_lines(lines, int(page["width"]), int(page["height"]))
+        _apply_confirmation(page.get("lines") or [], cleaned)
+        page["lines"] = cleaned
         if sensitivity is not None:
             page["sensitivity"] = _clamp_sensitivity(sensitivity)
         self._save()
@@ -280,9 +360,11 @@ class DeskStore:
                     continue
                 text = limit_text(texts[line["id"]])
                 if not line.get("parts"):
-                    line["parts"] = [{"id": _new_id("pt"), "text": text}]
+                    line["parts"] = [{"id": _new_id("pt"), "text": text, "confirmed": False, "skipped": False}]
                 else:
                     line["parts"][0]["text"] = text
+                    line["parts"][0]["confirmed"] = False
+                    line["parts"][0]["skipped"] = False
             self._save()
             return self.public_page(page)
 
@@ -300,9 +382,10 @@ class DeskStore:
     def delete_page(self, page_id: str) -> None:
         self._require(page_id)
         self.session["pages"] = [page for page in self.session["pages"] if page["id"] != page_id]
-        path = self.images / f"{page_id}.jpg"
-        if path.is_file():
-            path.unlink()
+        for name in (f"{page_id}.jpg", f"{page_id}.thumb.jpg"):
+            path = self.images / name
+            if path.is_file():
+                path.unlink()
         self._save()
 
     def image_path(self, page_id: str) -> Path | None:
@@ -312,6 +395,40 @@ class DeskStore:
         if path.parent != self.images.resolve() or not path.is_file():
             return None
         return path
+
+    def thumb_path(self, page_id: str) -> Path | None:
+        """JPEG pequeno da página tratada, gerado uma vez e refeito se a imagem mudar."""
+        source = self.image_path(page_id)
+        if source is None:
+            return None
+        thumb = (self.images / f"{page_id}.thumb.jpg").resolve()
+        if thumb.parent != self.images.resolve():
+            return None
+        try:
+            if thumb.is_file() and thumb.stat().st_mtime >= source.stat().st_mtime:
+                return thumb
+        except OSError:
+            return None
+        Image.MAX_IMAGE_PIXELS = IMAGE_MAX_PIXELS
+        try:
+            with Image.open(source) as incoming:
+                image = ImageOps.exif_transpose(incoming) or incoming
+                image = image.convert("RGB")
+                image.thumbnail((280, 360), Image.Resampling.LANCZOS)
+                buffer = BytesIO()
+                image.save(buffer, format="JPEG", quality=72, optimize=True)
+                payload = buffer.getvalue()
+        except (OSError, UnidentifiedImageError, ValueError):
+            return None
+        temporary = thumb.with_name(f"{page_id}.thumb.jpg.tmp")
+        temporary.write_bytes(payload)
+        try:
+            temporary.replace(thumb)
+        except OSError:
+            thumb.write_bytes(payload)
+            if temporary.is_file():
+                temporary.unlink()
+        return thumb if thumb.is_file() else None
 
     def require_image(self, page_id: str) -> Path:
         path = self.image_path(page_id)
@@ -328,16 +445,29 @@ class DeskStore:
         return path
 
     def ensure_prepared(self, page_id: str) -> dict:
-        """Grava a imagem tratada no lugar da página e desloca as faixas junto com o corte."""
+        """Grava a imagem tratada no lugar da página e leva as faixas junto com o corte."""
         page = self._require(page_id)
-        if page.get("prepared"):
+        version = int(page.get("prep_version") or 0)
+        if page.get("prepared") and version >= PREP_VERSION:
             return page
         current = self.require_image(page_id)
         original = self.images / f"{page_id}.original.jpg"
         if not original.is_file():
+            if page.get("prepared"):
+                page["prep_version"] = PREP_VERSION
+                page.setdefault("view_scale", 1)
+                self._save()
+                return page
             original.write_bytes(current.read_bytes())
         decoded = load_image(original, invalid="Não foi possível reler a imagem da página.")
-        view, origin_x, origin_y = compose_reading_view(decoded)
+        if page.get("prepared"):
+            source_boxes = [
+                _to_original_box(line["box"], page.get("crop_origin") or [0, 0], page.get("view_scale") or 1)
+                for line in page.get("lines") or []
+            ]
+        else:
+            source_boxes = [line["box"] for line in page.get("lines") or []]
+        view, origin_x, origin_y, scale = compose_reading_view(decoded)
         height, width = view.shape[:2]
         current.write_bytes(encode_jpeg(view))
         page["width"] = int(width)
@@ -345,13 +475,15 @@ class DeskStore:
         page["original_width"] = int(decoded.shape[1])
         page["original_height"] = int(decoded.shape[0])
         page["crop_origin"] = [int(origin_x), int(origin_y)]
+        page["view_scale"] = int(scale)
+        page["prep_version"] = PREP_VERSION
         page["prepared"] = True
         page["lines"] = [
             {
                 **line,
-                "box": _shift_box(line["box"], origin_x, origin_y, width, height),
+                "box": _to_view_box(box, origin_x, origin_y, scale, width, height),
             }
-            for line in page.get("lines") or []
+            for line, box in zip(page.get("lines") or [], source_boxes)
         ]
         self._save()
         return page
@@ -368,6 +500,7 @@ class DeskStore:
             "default_sensitivity": settings.default_sensitivity,
             "reader": settings.reader_label(),
             "work_dir": str(self.root),
+            "vector_search": bool(settings.database_url),
             "pages": pages,
         }
 
@@ -383,9 +516,11 @@ class DeskStore:
             "original_width": int(page.get("original_width") or page["width"]),
             "original_height": int(page.get("original_height") or page["height"]),
             "crop_origin": [int(origin[0]), int(origin[1])],
+            "view_scale": float(page.get("view_scale") or 1),
             "prepared": bool(page.get("prepared")),
             "sensitivity": float(page.get("sensitivity") or get_settings().default_sensitivity),
             "image_url": f"/images/{page['id']}?v={stamp}",
+            "thumb_url": f"/images/{page['id']}/thumb?v={stamp}",
             "original_url": f"/images/{page['id']}/original?v={stamp}",
             "lines": annotate_lines(page.get("lines") or []),
         }
@@ -456,6 +591,17 @@ class DeskStore:
             chunks.append("")
         return "\n".join(chunks).rstrip() + "\n"
 
+    def _strip_fragments(self) -> bool:
+        """Tira faixas que são mancha no vão, não linha de texto."""
+        changed = False
+        for page in self.session.get("pages") or []:
+            lines = list(page.get("lines") or [])
+            kept = _without_fragments(lines)
+            if len(kept) != len(lines):
+                page["lines"] = kept
+                changed = True
+        return changed
+
     def _require(self, page_id: str) -> dict:
         if not PAGE_ID_RE.fullmatch(page_id):
             raise FileNotFoundError(f"Página {page_id} não encontrada")
@@ -477,6 +623,11 @@ class DeskStore:
         temporary = self.path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(self.session, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
+
+
+def _without_fragments(lines: list[dict]) -> list[dict]:
+    flags = keep_line_boxes([line["box"] for line in lines])
+    return [line for line, keep in zip(lines, flags) if keep]
 
 
 def _safe_name(filename: str) -> str:

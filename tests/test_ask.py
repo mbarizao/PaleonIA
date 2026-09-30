@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from paleonia.ask import ask
+from paleonia.reading.ask import ask
 from paleonia.config import Settings, _llm_choice
 
 
@@ -61,7 +61,7 @@ class RemoteReaderTests(unittest.TestCase):
             return _response({"choices": [{"message": {"content": '{"linhas":["abc"]}'}}]})
 
         image = np.zeros((8, 12, 3), np.uint8)
-        with patch("paleonia.ask.urllib.request.urlopen", fake_urlopen):
+        with patch("paleonia.reading.ask.urllib.request.urlopen", fake_urlopen):
             result = ask(_api_settings(llm_timeout=12), "leia", image, attempts=1)
 
         self.assertEqual(result, {"linhas": ["abc"]})
@@ -90,7 +90,7 @@ class RemoteReaderTests(unittest.TestCase):
                 )
             return _response({"choices": [{"message": {"content": [{"type": "text", "text": '{"linhas":["ok"]}'}]}}]})
 
-        with patch("paleonia.ask.urllib.request.urlopen", fake_urlopen):
+        with patch("paleonia.reading.ask.urllib.request.urlopen", fake_urlopen):
             result = ask(_api_settings(), "leia", np.zeros((4, 4, 3), np.uint8), attempts=1)
 
         self.assertEqual(result["linhas"], ["ok"])
@@ -101,7 +101,7 @@ class RemoteReaderTests(unittest.TestCase):
         def fail_urlopen(*_args, **_kwargs):
             raise AssertionError("não deveria chamar a API")
 
-        with patch("paleonia.ask.urllib.request.urlopen", fail_urlopen):
+        with patch("paleonia.reading.ask.urllib.request.urlopen", fail_urlopen):
             with self.assertRaises(ValueError) as caught:
                 ask(_api_settings(llm_api_key=""), "leia", np.zeros((4, 4, 3), np.uint8), attempts=1)
         self.assertIn("LLM_API_KEY", str(caught.exception))

@@ -7,3 +7,4 @@ Pillow>=10.4.0
 ollama>=0.4.8
 kraken>=7.1
 python-dotenv>=1.0.1
+psycopg[binary]>=3.2.0

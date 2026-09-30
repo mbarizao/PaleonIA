@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from paleonia.config import Settings, require_remote_llm
-from paleonia.preprocess import png_bytes
+from paleonia.image_enhance.preprocess import png_bytes
 
 _THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
 

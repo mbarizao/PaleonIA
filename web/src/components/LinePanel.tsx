@@ -34,6 +34,11 @@ export function LinePanel({
 }: Props) {
   const lines = page ? annotate(page.lines) : [];
   const selected = lines.find((line) => line.id === selectedLineId) || null;
+
+  useEffect(() => {
+    if (!selectedLineId) return;
+    document.getElementById(`line-${selectedLineId}`)?.scrollIntoView({ block: "nearest" });
+  }, [selectedLineId]);
   const numbers = selected?.parts.map((part) => part.linha_transcrita).filter((value): value is number => Boolean(value)) || [];
   const transcript =
     numbers.length === 0 ? "—" : numbers.length === 1 ? `T-${pad(numbers[0])}` : `T-${pad(numbers[0])}–${pad(numbers[numbers.length - 1])}`;
@@ -71,13 +76,11 @@ export function LinePanel({
             }}
           >
             <Space size={6} wrap>
-              <Tag color="#0a253e" style={{ margin: 0, fontWeight: 700 }}>
+              <Tag className="tag-doc">
                 D-{pad(line.linha_documento || 0)}
               </Tag>
               {line.include && line.parts.some((part) => part.linha_transcrita) ? (
-                <Tag style={{ margin: 0, color: "#6b5420", background: "#f6f1e6", borderColor: "#e4d3ae", fontWeight: 700 }}>
-                  {transcriptLabel(line)}
-                </Tag>
+                <Tag className="tag-tx">{transcriptLabel(line)}</Tag>
               ) : (
                 <Tag style={{ margin: 0 }}>fora da transcrição</Tag>
               )}
@@ -102,7 +105,7 @@ export function LinePanel({
                       onNext();
                     }
                   }}
-                  style={part.id === selectedPartId ? { borderColor: "#ab7e32", boxShadow: "0 0 0 2px rgba(171, 126, 50, 0.15)" } : undefined}
+                  className={part.id === selectedPartId ? "line-input selected" : "line-input"}
                 />
                 {line.parts.length > 1 ? (
                   <Button type="text" size="small" onClick={() => onRemovePart(line.id, part.id)} style={{ justifySelf: "start" }}>

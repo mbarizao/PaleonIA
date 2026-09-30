@@ -72,7 +72,7 @@ def save_image(image: np.ndarray, path: str | Path) -> Path:
 
 def enhance_document(image: ImageInput) -> np.ndarray:
     """Atalho com parâmetros padrão; o fluxo híbrido usa EnhanceParams da IA."""
-    from paleonia.enhance import apply_enhance
+    from paleonia.image_enhance.enhance import apply_enhance
 
     bgr = load_image(image)
     gray = apply_enhance(bgr)

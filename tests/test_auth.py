@@ -4,8 +4,8 @@ import unittest
 from fastapi.testclient import TestClient
 
 from paleonia import config
-from paleonia.auth import issue_token, read_username
-from paleonia.desk import create_app
+from paleonia.api.app import create_app
+from paleonia.api.auth import issue_token, read_username
 
 
 class AuthTests(unittest.TestCase):
@@ -46,3 +46,5 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(read_username(token, settings, now=1_000), "paleonia")
         self.assertIsNone(read_username(token + "x", settings, now=1_000))
         self.assertIsNone(read_username(token, settings, now=1_000 + 60 * 60 * 24 * 8))
+        other = issue_token(settings, "maria", now=1_000)
+        self.assertEqual(read_username(other, settings, now=1_000), "maria")

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -12,19 +11,8 @@ import cv2
 import numpy as np
 
 from paleonia.config import PROJECT_ROOT, get_settings
-from paleonia.preprocess import save_image, to_pil
-from paleonia.wsl import home as wsl_home
-from paleonia.wsl import is_executable
-
-
-def _wsl_path(path: Path) -> str:
-    resolved = path.resolve()
-    text = str(resolved)
-    if len(text) >= 2 and text[1] == ":":
-        drive = text[0].lower()
-        rest = text[2:].replace("\\", "/")
-        return f"/mnt/{drive}{rest}"
-    return text.replace("\\", "/")
+from paleonia.image_enhance.preprocess import save_image, to_pil
+from paleonia.segment.fragments import drop_fragment_boxes
 
 
 def _resolve_device(requested: str) -> str:
@@ -95,7 +83,7 @@ def boxes_from_segmentation(segmentation, shape: tuple[int, int]) -> list[list[i
         if box[3] - box[1] > height * 0.22:
             continue
         boxes.append(box)
-    return boxes
+    return drop_fragment_boxes(boxes)
 
 
 def _segment_local(image: np.ndarray, device: str) -> list[list[int]]:
@@ -150,44 +138,6 @@ def _segment_via_windows(image_path: Path, device: str) -> list[list[int]] | Non
     return _run_segment_command(command, env=env)
 
 
-def _wsl_kraken_python() -> str | None:
-    configured = get_settings().kraken_wsl_python
-    if configured:
-        return configured if is_executable(configured) else None
-    home = wsl_home()
-    if not home:
-        return None
-    candidate = f"{home}/.venv-transcript-kraken/bin/python"
-    return candidate if is_executable(candidate) else None
-
-
-def _segment_via_wsl(image_path: Path, device: str) -> list[list[int]]:
-    python_wsl = _wsl_kraken_python()
-    if not python_wsl:
-        raise RuntimeError(
-            "O modelo de linhas (Kraken blla) não está instalado neste Python. "
-            "Defina KRAKEN_PYTHON com o python.exe do ambiente em que o Kraken foi instalado, "
-            "ou KRAKEN_WSL_PYTHON com o python do WSL. No WSL também serve:\n"
-            "  python3 -m venv ~/.venv-transcript-kraken\n"
-            "  ~/.venv-transcript-kraken/bin/pip install kraken opencv-python-headless pillow"
-        )
-    root_wsl = _wsl_path(PROJECT_ROOT)
-    inner = " ".join(
-        shlex.quote(part)
-        for part in (
-            python_wsl,
-            "-m",
-            "paleonia.segment",
-            "--image",
-            _wsl_path(image_path),
-            "--device",
-            device,
-        )
-    )
-    script = f"cd {shlex.quote(root_wsl)} && PYTHONPATH={shlex.quote(root_wsl)} {inner}"
-    return _run_segment_command(["wsl", "-e", "bash", "-lc", script])
-
-
 def segment_line_boxes(
     image: np.ndarray,
     *,
@@ -214,16 +164,22 @@ def segment_line_boxes(
             windows = _segment_via_windows(path, device)
             if windows is not None:
                 return windows
-            return _segment_via_wsl(path, device)
+            raise RuntimeError(
+                "O modelo de linhas (Kraken blla) não está instalado neste Python. "
+                "Defina KRAKEN_PYTHON com o python.exe do ambiente em que o Kraken foi instalado."
+            )
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
 
-def _cli(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Localiza linhas de manuscrito com o Kraken blla")
+    parser = argparse.ArgumentParser(
+        prog="paleonia.segment",
+        description="Localiza linhas de manuscrito com o Kraken blla",
+    )
     parser.add_argument("--image", required=True)
     parser.add_argument("--device", default=None)
     args = parser.parse_args(argv)
@@ -234,6 +190,3 @@ def _cli(argv: list[str] | None = None) -> int:
     print(json.dumps({"lines": [{"box": box} for box in boxes]}, ensure_ascii=False))
     return 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(_cli())

@@ -2,12 +2,8 @@
 from __future__ import annotations
 
 import os
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
-
-from paleonia.wsl import eth0_ip
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMAGE_MAX_PIXELS = 300_000_000
@@ -129,11 +125,10 @@ class Settings:
     llm_max_tokens: int = 1600
     llm_image_long_side: int = 1600
     llm_attempts: int = 2
-    ollama_host: str = ""
+    ollama_host: str = "http://127.0.0.1:11434"
 
     kraken_device: str = "auto"
     kraken_python: str = ""
-    kraken_wsl_python: str = ""
     kraken_timeout: float = 600
 
     jpeg_quality: int = 93
@@ -142,6 +137,14 @@ class Settings:
     max_text_chars: int = 20000
     read_group_max_height: int = 520
     read_group_max_count: int = 8
+
+    database_url: str = ""
+    embed_provider: str = "ollama"
+    embed_model: str = "nomic-embed-text"
+    embed_base_url: str = ""
+    embed_api_key: str = ""
+    embed_dimensions: int = 768
+    embed_timeout: float = 60.0
 
     @property
     def download_stem(self) -> str:
@@ -193,9 +196,33 @@ def _llm_choice() -> tuple[str, str, str]:
     return provider, model, base
 
 
+def _embed_choice(llm_provider: str, llm_base_url: str) -> tuple[str, str, str, int, str]:
+    requested = (_raw("EMBED_PROVIDER") or ("ollama" if llm_provider == "ollama" else "openai")).lower()
+    if requested not in {"ollama", "openai", "openrouter"}:
+        raise ValueError(
+            "EMBED_PROVIDER deve ser ollama, openai ou openrouter, "
+            f"recebeu {requested!r}."
+        )
+    provider = "ollama" if requested == "ollama" else "openai"
+    if provider == "ollama":
+        model = _raw("EMBED_MODEL") or "nomic-embed-text"
+        dimensions = _env_int("EMBED_DIMENSIONS", 768)
+        base = ""
+        key = ""
+    else:
+        model = _raw("EMBED_MODEL") or "text-embedding-3-small"
+        dimensions = _env_int("EMBED_DIMENSIONS", 768)
+        base = (_raw("EMBED_BASE_URL") or llm_base_url).rstrip("/")
+        key = _raw("EMBED_API_KEY") or _raw("LLM_API_KEY")
+    if not 1 <= dimensions <= 4096:
+        raise ValueError("EMBED_DIMENSIONS precisa ficar entre 1 e 4096.")
+    return provider, model, base, dimensions, key
+
+
 def _build_settings() -> Settings:
     load_env()
     provider, model, base_url = _llm_choice()
+    embed_provider, embed_model, embed_base_url, embed_dimensions, embed_api_key = _embed_choice(provider, base_url)
     return Settings(
         app_name=_env_str("APP_NAME", "PaleonIA"),
         app_version=_env_str("APP_VERSION", "1.0.0"),
@@ -218,9 +245,9 @@ def _build_settings() -> Settings:
         llm_max_tokens=_env_int_first(("LLM_MAX_TOKENS", "OLLAMA_NUM_PREDICT"), 1600),
         llm_image_long_side=_env_int_first(("LLM_IMAGE_LONG_SIDE", "OLLAMA_IMAGE_LONG_SIDE"), 1600),
         llm_attempts=_env_int_first(("LLM_ATTEMPTS", "OLLAMA_ATTEMPTS"), 2),
+        ollama_host=normalize_host(_raw("OLLAMA_HOST") or "http://127.0.0.1:11434"),
         kraken_device=_env_str("KRAKEN_DEVICE", "auto"),
         kraken_python=_raw("KRAKEN_PYTHON"),
-        kraken_wsl_python=_raw("KRAKEN_WSL_PYTHON"),
         kraken_timeout=_env_float("KRAKEN_TIMEOUT", 600),
         jpeg_quality=_env_int("JPEG_QUALITY", 93),
         default_sensitivity=_env_float("DEFAULT_SENSITIVITY", 0.55),
@@ -228,6 +255,13 @@ def _build_settings() -> Settings:
         max_text_chars=_env_int("MAX_TEXT_CHARS", 20000),
         read_group_max_height=_env_int("READ_GROUP_MAX_HEIGHT", 520),
         read_group_max_count=_env_int("READ_GROUP_MAX_COUNT", 8),
+        database_url=_raw("DATABASE_URL"),
+        embed_provider=embed_provider,
+        embed_model=embed_model,
+        embed_base_url=embed_base_url,
+        embed_api_key=embed_api_key,
+        embed_dimensions=embed_dimensions,
+        embed_timeout=_env_float("EMBED_TIMEOUT", 60),
     )
 
 
@@ -244,41 +278,6 @@ def limit_text(text: str) -> str:
     return text if len(text) <= limit else text[:limit]
 
 
-def ollama_is_up(host: str, timeout: float = 2.0) -> bool:
-    url = f"{normalize_host(host)}/api/tags"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            return 200 <= response.status < 300
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        return False
-
-
-def discover_ollama_host() -> str:
-    """Encontra o Ollama no Windows, no WSL ou via OLLAMA_HOST."""
-    load_env()
-    configured = _raw("OLLAMA_HOST") or _raw("OLLAMA_BASE_URL")
-    candidates: list[str] = []
-    if configured:
-        candidates.append(normalize_host(configured))
-    candidates.extend(["http://127.0.0.1:11434", "http://localhost:11434"])
-    wsl_ip = eth0_ip()
-    if wsl_ip:
-        candidates.append(f"http://{wsl_ip}:11434")
-    seen: set[str] = set()
-    unique = [host for host in candidates if not (host in seen or seen.add(host))]
-    for host in unique:
-        if ollama_is_up(host):
-            return host
-    tried = ", ".join(unique)
-    raise ConnectionError(
-        "Não foi possível conectar ao Ollama. "
-        f"Endereços tentados: {tried}. "
-        "Se o modelo roda no WSL, confirme que ele escuta em 0.0.0.0:11434 "
-        "(OLLAMA_HOST=0.0.0.0:11434 dentro do WSL) e defina OLLAMA_HOST no .env "
-        "como http://<IP-do-WSL>:11434."
-    )
-
-
 def require_remote_llm(settings: Settings) -> None:
     """Garante URL e chave antes de chamar uma API compatível com a OpenAI."""
     if not settings.llm_base_url:
@@ -291,15 +290,13 @@ def require_remote_llm(settings: Settings) -> None:
 
 
 def reading_settings() -> Settings:
-    """Configuração pronta para ler. O Ollama só é procurado quando o provedor é ollama."""
+    """Configuração pronta para ler. Com API remota, exige URL e chave."""
     global _READING
     if _READING is None:
         base = get_settings()
-        if base.llm_provider == "ollama":
-            _READING = replace(base, ollama_host=discover_ollama_host())
-        else:
+        if base.llm_provider != "ollama":
             require_remote_llm(base)
-            _READING = base
+        _READING = base
     return _READING
 
 

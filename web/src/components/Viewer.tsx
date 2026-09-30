@@ -2,7 +2,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import type { Line, Page } from "@/lib/types";
-import { annotate, clampBox, labelFor, newId, toViewBox, viewMetrics } from "@/lib/lines";
+import { annotate, clampBox, labelFor, newId, toViewBox, viewMetrics, viewScale } from "@/lib/lines";
 
 const MIN_ZOOM = 0.05;
 const MAX_ZOOM = 40;
@@ -192,7 +192,11 @@ export const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
     const y = (clientY - rect.top - panY) / zoom;
     const current = pageRef.current;
     const origin = showRef.current ? current.crop_origin || [0, 0] : [0, 0];
-    return { x: x - Number(origin[0] || 0), y: y - Number(origin[1] || 0) };
+    const scale = showRef.current ? viewScale(current) : 1;
+    return {
+      x: (x - Number(origin[0] || 0)) * scale,
+      y: (y - Number(origin[1] || 0)) * scale,
+    };
   }
 
   function hitEdge(x: number, y: number) {
@@ -280,6 +284,7 @@ export const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
           return;
         }
         const current = pageRef.current;
+        const unit = viewScale(current);
         if (currentDrag.kind === "move") {
           const dx = point.x - currentDrag.start.x;
           const dy = point.y - currentDrag.start.y;
@@ -292,9 +297,9 @@ export const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
           currentDrag.moved = true;
         } else if (currentDrag.kind === "top" || currentDrag.kind === "bottom") {
           const next = [...currentDrag.origin];
-          if (currentDrag.kind === "top") next[1] = Math.min(point.y, currentDrag.origin[3] - 8);
-          else next[3] = Math.max(point.y, currentDrag.origin[1] + 8);
-          replaceLine(currentDrag.lineId, clampBox(next, current.width, current.height, 8));
+          if (currentDrag.kind === "top") next[1] = Math.min(point.y, currentDrag.origin[3] - 8 * unit);
+          else next[3] = Math.max(point.y, currentDrag.origin[1] + 8 * unit);
+          replaceLine(currentDrag.lineId, clampBox(next, current.width, current.height, 8 * unit));
           currentDrag.moved = true;
         } else if (currentDrag.kind === "draw") {
           let x0 = Math.min(currentDrag.start.x, point.x);
@@ -306,7 +311,7 @@ export const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
             x1 = current.width * 0.98;
           }
           currentDrag.draft = [x0, y0, x1, y1];
-          currentDrag.moved = Math.abs(point.y - currentDrag.start.y) > 4;
+          currentDrag.moved = Math.abs(point.y - currentDrag.start.y) > 4 * unit;
           draw();
         }
       }}
@@ -316,7 +321,12 @@ export const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
         scrollRef.current?.classList.remove("panning");
         if (!currentDrag || !currentDrag.moved) return;
         if (currentDrag.kind === "draw" && currentDrag.draft) {
-          const box = clampBox(currentDrag.draft, pageRef.current.width, pageRef.current.height, 8);
+          const box = clampBox(
+            currentDrag.draft,
+            pageRef.current.width,
+            pageRef.current.height,
+            8 * viewScale(pageRef.current),
+          );
           const line: Line = {
             id: newId("ln"),
             box,

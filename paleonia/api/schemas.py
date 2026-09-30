@@ -7,6 +7,8 @@ class PartIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     id: str
     text: str = ""
+    confirmed: bool = False
+    skipped: bool = False
 
 
 class LineIn(BaseModel):

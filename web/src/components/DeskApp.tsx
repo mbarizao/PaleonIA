@@ -1,20 +1,22 @@
 "use client";
 
-import {
-  DeleteOutlined,
-  ExportOutlined,
-  LogoutOutlined,
-  UploadOutlined,
-} from "@ant-design/icons";
-import { App, Badge, Button, Dropdown, Form, Input, Layout, Modal, Segmented, Slider, Space, Spin, Upload } from "antd";
+import { DownloadOutlined, LogoutOutlined, UploadOutlined } from "@ant-design/icons";
+import { App, Badge, Button, Form, Input, Layout, Modal, Segmented, Slider, Space, Spin, Upload } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, setUnauthorizedHandler } from "@/lib/api";
-import { annotate, newId, sensText, stripLine } from "@/lib/lines";
+import { api, setUnauthorizedHandler, streamImport } from "@/lib/api";
+import { annotate, draftParts, newId, sensText, stripLine } from "@/lib/lines";
 import type { AuthState, Line, Page, Session, TranscribeJob } from "@/lib/types";
+import { Corrections } from "./Corrections";
+import { Library } from "./Library";
+import { ThemeToggle } from "./theme-mode";
 import { LinePanel } from "./LinePanel";
 import { Viewer, type ViewerHandle } from "./Viewer";
 
-const { Header, Sider, Content } = Layout;
+const { Header, Content } = Layout;
+
+type DeskTab = "inicio" | "mesa" | "correcoes";
+
+const MESA_PAGE_KEY = "paleonia.mesaPage";
 
 export function DeskApp() {
   const { message, modal } = App.useApp();
@@ -31,6 +33,11 @@ export function DeskApp() {
   const [busy, setBusy] = useState<{ title: string; detail: string; error?: boolean } | null>(null);
   const [loginError, setLoginError] = useState("");
   const [rewriteOpen, setRewriteOpen] = useState(false);
+  const [tab, setTab] = useState<DeskTab>("inicio");
+  const [importing, setImporting] = useState(false);
+  const importingRef = useRef(false);
+  const previewRef = useRef<HTMLCanvasElement>(null);
+  const previewScale = useRef(1);
   const viewerRef = useRef<ViewerHandle>(null);
   const saveTimer = useRef<number>(0);
   const pageRef = useRef<Page | null>(null);
@@ -55,7 +62,17 @@ export function DeskApp() {
         setAuth(state);
         if (!state.required || state.authenticated) {
           const data = await loadSession();
-          if (data.pages[0]) openStored(data.pages[0]);
+          if (window.location.hash === "#mesa") {
+            const savedId = window.sessionStorage.getItem(MESA_PAGE_KEY);
+            const found = savedId ? data.pages.find((item) => item.id === savedId) : undefined;
+            if (found) {
+              openStored(found);
+              setTab("mesa");
+            } else {
+              window.sessionStorage.removeItem(MESA_PAGE_KEY);
+              chooseTab("inicio");
+            }
+          }
         }
       })
       .catch((error: Error) => message.error(error.message))
@@ -80,14 +97,27 @@ export function DeskApp() {
     };
   }, []);
 
-  function openStored(next: Page) {
+  function openStored(next: Page, focus?: { lineId: string; partId: string | null }) {
+    if (pageRef.current && pageRef.current.id !== next.id) void flushSave();
+    pageRef.current = next;
+    window.sessionStorage.setItem(MESA_PAGE_KEY, next.id);
     setPageId(next.id);
     setPage(next);
-    setSelectedLineId(null);
-    setSelectedPartId(null);
+    setSelectedLineId(focus?.lineId ?? null);
+    setSelectedPartId(focus?.partId ?? null);
     setTool("select");
     setShowOriginal(false);
   }
+
+  function chooseTab(next: DeskTab) {
+    setTab(next);
+    const hash = next === "inicio" ? "" : `#${next}`;
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${hash}`);
+  }
+
+  useEffect(() => {
+    if (window.location.hash === "#correcoes") setTab("correcoes");
+  }, []);
 
   function scheduleSave(next: Page) {
     pageRef.current = next;
@@ -124,8 +154,8 @@ export function DeskApp() {
       await api("/api/login", { method: "POST", body: JSON.stringify(values) });
       const state = await api<AuthState>("/api/auth");
       setAuth(state);
-      const data = await loadSession();
-      if (data.pages[0]) openStored(data.pages[0]);
+      await loadSession();
+      chooseTab("inicio");
     } catch (error) {
       setLoginError(error instanceof Error ? error.message : "Usuário ou senha incorretos.");
     }
@@ -139,11 +169,14 @@ export function DeskApp() {
   }
 
   async function importFiles(fileList: File[]) {
+    if (importingRef.current) return;
     const files = fileList.filter((file) => /\.(jpe?g|png|tif|tiff|webp)$/i.test(file.name) || file.type.startsWith("image/"));
     if (!files.length) {
       message.warning("Use imagens JPG, PNG, TIFF ou WEBP.");
       return;
     }
+    importingRef.current = true;
+    setImporting(true);
     const body = new FormData();
     files.forEach((file) => body.append("files", file));
     setBusy({
@@ -152,13 +185,39 @@ export function DeskApp() {
     });
     try {
       await flushSave();
-      const created = await api<{ pages: Page[]; errors: string[] }>("/api/pages", { method: "POST", body });
+      const created = await streamImport(body, async (event) => {
+        const detail = event.stage === "original" ? `${event.filename} · Preparando o documento…`
+          : event.stage === "tile" ? `Zoom + Melhorias · bloco ${event.done} de ${event.total}`
+          : event.stage === "crop" ? "Refilagem · ajustando as bordas…"
+          : event.stage === "finished" ? "Melhorias concluídas · marcando as linhas…" : null;
+        if (detail) setBusy({ title: "Preparando documento", detail });
+        if (!event.image) return;
+        const image = new Image();
+        image.src = event.image;
+        await image.decode();
+        const canvas = previewRef.current;
+        const ctx = canvas?.getContext("2d");
+        if (!canvas || !ctx) return;
+        if (event.stage === "original" || event.stage === "finished") {
+          previewScale.current = Math.min(1, 1400 / Math.max(event.width, event.height));
+          canvas.width = Math.round(event.width * previewScale.current);
+          canvas.height = Math.round(event.height * previewScale.current);
+          ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+        } else {
+          const unit = previewScale.current / event.scale;
+          ctx.drawImage(image, event.x * unit, event.y * unit, event.width * unit, event.height * unit);
+        }
+      });
+      setImporting(false);
+      if (!created.pages.length) throw new Error(created.errors.join(" ") || "Nenhuma imagem recebida");
+      if (created.errors.length) message.warning(created.errors.join(" "));
       if (created.errors?.length) setBusy((current) => current && { ...current, detail: created.errors.join(" ") });
       const data = await loadSession();
       const ids = (created.pages || []).map((item) => item.id);
       if (ids[0]) {
         const first = data.pages.find((item) => item.id === ids[0]);
         if (first) openStored(first);
+        chooseTab("mesa");
       }
       if (ids.length) {
         setBusy({ title: "Lendo o texto", detail: "A transcrição das linhas vazias começou." });
@@ -173,6 +232,9 @@ export function DeskApp() {
       message.success(ids.length === 1 ? "Imagem importada." : `${ids.length} imagens importadas.`);
     } catch (error) {
       setBusy({ title: "Não foi possível concluir", detail: error instanceof Error ? error.message : "Falha na importação", error: true });
+    } finally {
+      importingRef.current = false;
+      setImporting(false);
     }
   }
   importRef.current = importFiles;
@@ -232,7 +294,7 @@ export function DeskApp() {
         const status = await runTranscribe(page.id, onlyEmpty);
         if (status !== "error") {
           setBusy(null);
-          message.success("Transcrição pronta. O texto pode ser corrigido.");
+          message.success("Transcrição pronta. O texto fica como rascunho até você conferir.");
         }
       } catch (error) {
         setBusy({ title: "Não foi possível concluir", detail: error instanceof Error ? error.message : "Falha na transcrição", error: true });
@@ -300,8 +362,40 @@ export function DeskApp() {
   function updateLines(lines: Line[]) {
     if (!pageRef.current) return;
     const added = lines.find((line) => !pageRef.current?.lines.some((item) => item.id === line.id));
-    scheduleSave({ ...pageRef.current, lines });
+    const next = { ...pageRef.current, lines };
+    scheduleSave(next);
+    setSession((current) =>
+      current ? { ...current, pages: current.pages.map((item) => (item.id === next.id ? { ...item, lines } : item)) } : current,
+    );
     if (added) setTool("select");
+  }
+
+  function commitReview(target: Page, lineId: string, partId: string, text: string, mark: "confirmed" | "skipped") {
+    const source = pageRef.current?.id === target.id ? pageRef.current : target;
+    const lines = source.lines.map((line) =>
+      line.id === lineId
+        ? {
+            ...line,
+            parts: line.parts.map((part) =>
+              part.id === partId
+                ? { ...part, text, confirmed: mark === "confirmed", skipped: mark === "skipped" }
+                : part,
+            ),
+          }
+        : line,
+    );
+    if (pageRef.current?.id === target.id) {
+      updateLines(lines);
+      return;
+    }
+    const next = { ...target, lines };
+    setSession((current) =>
+      current ? { ...current, pages: current.pages.map((item) => (item.id === next.id ? next : item)) } : current,
+    );
+    void api(`/api/pages/${next.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ lines: lines.map(stripLine), sensitivity: Number(next.sensitivity) }),
+    }).catch((error: Error) => message.error(error.message));
   }
 
   function select(lineId: string | null, partId: string | null) {
@@ -329,11 +423,11 @@ export function DeskApp() {
         const data = await api<Session>(`/api/pages/${item.id}`, { method: "DELETE" });
         remember(data);
         if (pageId === item.id) {
-          if (data.pages[0]) openStored(data.pages[0]);
-          else {
-            setPage(null);
-            setPageId(null);
-          }
+          pageRef.current = null;
+          window.sessionStorage.removeItem(MESA_PAGE_KEY);
+          setPage(null);
+          setPageId(null);
+          chooseTab("inicio");
         }
       },
     });
@@ -360,7 +454,10 @@ export function DeskApp() {
         </aside>
         <main className="login-panel">
           <div className="login-card">
-            <h2>Entrar</h2>
+            <div className="login-card-head">
+              <h2>Entrar</h2>
+              <ThemeToggle />
+            </div>
             <p className="lead">Use as credenciais definidas para esta instalação.</p>
             <Form layout="vertical" initialValues={{ username: auth.username || "paleonia" }} onFinish={login} requiredMark={false}>
               <Form.Item label="Usuário" name="username" rules={[{ required: true, message: "Informe o usuário" }]}>
@@ -369,7 +466,7 @@ export function DeskApp() {
               <Form.Item label="Senha" name="password" rules={[{ required: true, message: "Informe a senha" }]}>
                 <Input.Password size="large" autoComplete="current-password" />
               </Form.Item>
-              {loginError ? <p style={{ color: "#a32626", marginTop: 0 }}>{loginError}</p> : null}
+              {loginError ? <p style={{ color: "var(--danger)", marginTop: 0 }}>{loginError}</p> : null}
               <Button type="primary" htmlType="submit" size="large" block>
                 Entrar
               </Button>
@@ -381,6 +478,8 @@ export function DeskApp() {
   }
 
   const pages = session?.pages || [];
+  const livePages = pages.map((item) => (page && item.id === page.id ? page : item));
+  const draftTotal = draftParts(livePages).length;
   const name = session?.app_name || "PaleonIA";
   const lineCount = page?.lines.length ?? 0;
 
@@ -392,55 +491,78 @@ export function DeskApp() {
           <span className="app-brand-rule" />
           <span className="app-brand-caption">Mesa de transcrição</span>
         </div>
+        <nav className="app-tabs" aria-label="Mesa de transcrição">
+            <button type="button" aria-current={tab === "inicio" ? "page" : undefined} onClick={() => chooseTab("inicio")}>
+              Início
+            </button>
+            <button
+              type="button"
+              aria-current={tab === "mesa" ? "page" : undefined}
+              onClick={() => {
+                if (!pageRef.current) {
+                  message.info("Escolha uma página para abrir a mesa.");
+                  chooseTab("inicio");
+                  return;
+                }
+                chooseTab("mesa");
+              }}
+            >
+              Mesa
+            </button>
+            <button type="button" aria-current={tab === "correcoes" ? "page" : undefined} onClick={() => chooseTab("correcoes")}>
+              Correções
+              {draftTotal > 0 ? <span className="app-tab-count">{draftTotal}</span> : null}
+            </button>
+          </nav>
         <div className="app-header-actions">
-          {session?.reader ? <span className="app-meta">{session.reader}</span> : null}
           {auth?.username ? <span className="app-user">{auth.username}</span> : null}
+          <ThemeToggle />
           <ImageUpload onFiles={(files) => void importFiles(files)}>
-            <Button icon={<UploadOutlined />}>Importar</Button>
+            <Button className="header-primary" icon={<UploadOutlined />}>
+              Importar
+            </Button>
           </ImageUpload>
-          <Dropdown
-            menu={{
-              items: [
-                { key: "txt", label: "Texto (.txt)", onClick: () => downloadExport("/api/export.txt") },
-                { key: "json", label: "Documento (.json)", onClick: () => downloadExport("/api/export.json") },
-              ],
-            }}
-          >
-            <Button icon={<ExportOutlined />}>Exportar</Button>
-          </Dropdown>
+          {tab === "mesa" ? (
+            <Button type="text" icon={<DownloadOutlined />} onClick={() => downloadExport("/api/export.txt")}>
+              Baixar texto
+            </Button>
+          ) : null}
           {auth?.required ? (
-            <Button icon={<LogoutOutlined />} onClick={() => void logout()}>
+            <Button type="text" icon={<LogoutOutlined />} onClick={() => void logout()}>
               Sair
             </Button>
           ) : null}
         </div>
       </Header>
       <Layout className="app-body">
-        <Sider width={248} theme="light" className="page-rail">
-          <p className="rail-label">Páginas</p>
-          <nav className="page-list">
-            {pages.length === 0 ? <p className="page-empty">Nenhuma página nesta sessão.</p> : null}
-            {pages.map((item) => (
-              <div key={item.id} className={item.id === pageId ? "page-item active" : "page-item"}>
-                <button type="button" className="page-open" onClick={() => openStored(item)}>
-                  <span className="page-name">{item.filename}</span>
-                  <span className="page-meta">
-                    {item.lines.length} {item.lines.length === 1 ? "linha" : "linhas"}
-                  </span>
-                </button>
-                <Button
-                  className="page-delete"
-                  type="text"
-                  size="small"
-                  icon={<DeleteOutlined />}
-                  aria-label={`Remover ${item.filename}`}
-                  onClick={() => void removePage(item)}
-                />
-              </div>
-            ))}
-          </nav>
-        </Sider>
-        <Content style={{ minWidth: 0, display: "flex" }}>
+        <Content style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
+          {tab === "inicio" ? (
+            <Library
+              pages={livePages}
+              vectorSearch={Boolean(session?.vector_search)}
+              onOpen={(target, focus) => {
+                openStored(target, focus);
+                chooseTab("mesa");
+              }}
+              onRemove={(item) => void removePage(item)}
+              importAction={
+                <ImageUpload onFiles={(files) => void importFiles(files)}>
+                  <Button type="primary" icon={<UploadOutlined />}>
+                    Escolher imagens
+                  </Button>
+                </ImageUpload>
+              }
+            />
+          ) : tab === "correcoes" ? (
+            <Corrections
+              pages={livePages}
+              onCommit={commitReview}
+              onOpen={(target, lineId, partId) => {
+                openStored(target, { lineId, partId });
+                chooseTab("mesa");
+              }}
+            />
+          ) : page ? (
           <div className="workspace">
             <div className="workspace-head">
               <div className="workspace-title">
@@ -467,24 +589,7 @@ export function DeskApp() {
                 </div>
               ) : null}
             </div>
-            {!page ? (
-              <div className="empty-desk">
-                <div className="empty-card">
-                  <img src="/brand/PaleonIA-logo.svg" alt="" />
-                  <h2>Comece por uma imagem</h2>
-                  <p>
-                    A linha no documento (D) é a faixa marcada na página. A linha transcrita (T) é o texto correspondente.
-                    JPG, PNG, TIFF ou WEBP. Também pode soltar os arquivos nesta janela.
-                  </p>
-                  <ImageUpload onFiles={(files) => void importFiles(files)}>
-                    <Button type="primary" icon={<UploadOutlined />}>
-                      Escolher imagens
-                    </Button>
-                  </ImageUpload>
-                </div>
-              </div>
-            ) : (
-              <div className="work-grid">
+            <div className="work-grid">
                 <section className="document-pane">
                   <div className="toolstrip">
                     <Space.Compact>
@@ -542,7 +647,16 @@ export function DeskApp() {
                     updateLines(
                       pageRef.current.lines.map((line) => ({
                         ...line,
-                        parts: line.parts.map((part) => (part.id === partId ? { ...part, text } : part)),
+                        parts: line.parts.map((part) =>
+                          part.id === partId
+                            ? {
+                                ...part,
+                                text,
+                                confirmed: Boolean(text.trim()) && Boolean(part.confirmed),
+                                skipped: Boolean(text.trim()) && Boolean(part.skipped) && !part.confirmed,
+                              }
+                            : part,
+                        ),
                       })),
                     );
                   }}
@@ -579,9 +693,9 @@ export function DeskApp() {
                   }}
                   onNext={() => moveSelection(1)}
                 />
-              </div>
-            )}
+            </div>
           </div>
+          ) : null}
         </Content>
       </Layout>
       <Modal
@@ -602,7 +716,7 @@ export function DeskApp() {
                 .then((status) => {
                   if (status !== "error") {
                     setBusy(null);
-                    message.success("Transcrição pronta. O texto pode ser corrigido.");
+                    message.success("Transcrição pronta. O texto fica como rascunho até você conferir.");
                   }
                 })
                 .catch((error: Error) => setBusy({ title: "Não foi possível concluir", detail: error.message, error: true }));
@@ -621,7 +735,7 @@ export function DeskApp() {
                 .then((status) => {
                   if (status !== "error") {
                     setBusy(null);
-                    message.success("Transcrição pronta. O texto pode ser corrigido.");
+                    message.success("Transcrição pronta. O texto fica como rascunho até você conferir.");
                   }
                 })
                 .catch((error: Error) => setBusy({ title: "Não foi possível concluir", detail: error.message, error: true }));
@@ -631,18 +745,25 @@ export function DeskApp() {
           </Button>,
         ]}
       >
-        <p style={{ margin: 0, color: "#5c6e80" }}>
-          A leitura pode preencher só as linhas vazias ou refazer o texto que já está na página.
+        <p style={{ margin: 0, color: "var(--muted-2)" }}>
+          A leitura nova entra como rascunho. Pode preencher só as linhas vazias ou refazer o texto que já está na página.
+          Refazer tira a marca de conferida.
         </p>
       </Modal>
       <Modal
         open={Boolean(busy)}
         title={busy?.title}
+        width={importing ? 820 : 520}
         closable={Boolean(busy?.error)}
         maskClosable={false}
         footer={busy?.error ? <Button onClick={() => setBusy(null)}>Fechar</Button> : null}
         onCancel={() => busy?.error && setBusy(null)}
       >
+        {importing && (
+          <div className="import-preview" aria-label="Documento sendo melhorado em blocos" aria-busy="true">
+            <canvas ref={previewRef} />
+          </div>
+        )}
         <Space align="start">
           {busy?.error ? null : <Spin />}
           <p style={{ margin: 0 }}>{busy?.detail}</p>
